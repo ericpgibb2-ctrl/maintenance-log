@@ -1,0 +1,169 @@
+<!--
+Maintenance Log skill — hidden webview runner.
+Responds to the `run_js` tool call dispatched by the Gemma 4 model.
+All data persists in webview localStorage under STORAGE_KEY.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<body>
+  <script>
+    const STORAGE_KEY = 'maintenance_log_records_v1';
+    const SCHEMA_VERSION = 1;
+    const MODEL_TAG = 'gemma-4-e4b';
+
+    const ALLOWED_EQUIPMENT = ['HVAC', 'electrical', 'plumbing', 'fixture', 'elevator', 'exterior', 'other'];
+    const ALLOWED_SEVERITY = ['low', 'medium', 'high', 'urgent'];
+
+    function newId() {
+      // Short ULID-ish: base36 timestamp + 6 random chars. Sortable, unique enough.
+      const t = Date.now().toString(36);
+      const r = Math.random().toString(36).slice(2, 8);
+      return `${t}-${r}`;
+    }
+
+    function nowISO() {
+      const d = new Date();
+      const pad = n => String(n).padStart(2, '0');
+      const tzOffsetMin = -d.getTimezoneOffset();
+      const sign = tzOffsetMin >= 0 ? '+' : '-';
+      const abs = Math.abs(tzOffsetMin);
+      const tz = `${sign}${pad(Math.floor(abs / 60))}:${pad(abs % 60)}`;
+      return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}${tz}`;
+    }
+
+    function loadAll() {
+      try {
+        const raw = localStorage.getItem(STORAGE_KEY);
+        return raw ? JSON.parse(raw) : [];
+      } catch (_) {
+        return [];
+      }
+    }
+
+    function saveAll(records) {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(records));
+    }
+
+    function normalize(input) {
+      const equipmentType = ALLOWED_EQUIPMENT.includes(input.equipment_type) ? input.equipment_type : 'other';
+      const severity = ALLOWED_SEVERITY.includes(input.severity) ? input.severity : 'medium';
+      const actions = Array.isArray(input.suggested_actions)
+        ? input.suggested_actions.slice(0, 4).map(s => String(s).trim()).filter(Boolean)
+        : [];
+      return {
+        id: input.id || newId(),
+        captured_at: input.captured_at || nowISO(),
+        location: input.location ? String(input.location).trim() : null,
+        equipment: {
+          type: equipmentType,
+          identifier: input.equipment_identifier ? String(input.equipment_identifier).trim() : null,
+          manufacturer: input.equipment_manufacturer ? String(input.equipment_manufacturer).trim() : null,
+        },
+        observation: input.observation ? String(input.observation).trim() : '',
+        severity,
+        suggested_actions: actions,
+        raw_transcript: input.raw_transcript ? String(input.raw_transcript) : '',
+        image_description: input.image_description ? String(input.image_description).trim() : null,
+        model: MODEL_TAG,
+        schema_version: SCHEMA_VERSION,
+      };
+    }
+
+    function applyUpdate(record, fields) {
+      const next = JSON.parse(JSON.stringify(record));
+      if ('location' in fields) next.location = fields.location ? String(fields.location).trim() : null;
+      if ('equipment_type' in fields) {
+        next.equipment.type = ALLOWED_EQUIPMENT.includes(fields.equipment_type) ? fields.equipment_type : next.equipment.type;
+      }
+      if ('equipment_identifier' in fields) {
+        next.equipment.identifier = fields.equipment_identifier ? String(fields.equipment_identifier).trim() : null;
+      }
+      if ('equipment_manufacturer' in fields) {
+        next.equipment.manufacturer = fields.equipment_manufacturer ? String(fields.equipment_manufacturer).trim() : null;
+      }
+      if ('observation' in fields) next.observation = fields.observation ? String(fields.observation).trim() : '';
+      if ('severity' in fields) {
+        if (ALLOWED_SEVERITY.includes(fields.severity)) next.severity = fields.severity;
+      }
+      if ('suggested_actions' in fields && Array.isArray(fields.suggested_actions)) {
+        next.suggested_actions = fields.suggested_actions.slice(0, 4).map(s => String(s).trim()).filter(Boolean);
+      }
+      if ('raw_transcript' in fields) next.raw_transcript = fields.raw_transcript ? String(fields.raw_transcript) : '';
+      if ('image_description' in fields) {
+        next.image_description = fields.image_description ? String(fields.image_description).trim() : null;
+      }
+      return next;
+    }
+
+    function toJSONL(records) {
+      // One JSON object per line — compatible with LanceDB / streaming-ingest pipelines.
+      return records.map(r => JSON.stringify(r)).join('\n');
+    }
+
+    window['ai_edge_gallery_get_result'] = async (dataStr) => {
+      try {
+        const input = JSON.parse(dataStr || '{}');
+        const action = input.action;
+        const records = loadAll();
+
+        if (action === 'log') {
+          const record = normalize(input);
+          records.push(record);
+          saveAll(records);
+          return JSON.stringify({
+            result: `Logged maintenance record ${record.id} — ${record.equipment.type}, severity ${record.severity}. ${records.length} record${records.length === 1 ? '' : 's'} in log.`,
+          });
+        }
+
+        if (action === 'show_dashboard') {
+          return JSON.stringify({
+            result: `Opening dashboard with ${records.length} record${records.length === 1 ? '' : 's'}.`,
+            webview: { url: 'dashboard.html', aspectRatio: 0.66 },
+          });
+        }
+
+        if (action === 'update') {
+          if (!input.id) throw new Error('update requires an id');
+          const idx = records.findIndex(r => r.id === input.id);
+          if (idx === -1) throw new Error(`No record with id ${input.id}`);
+          const fields = input.fields || {};
+          records[idx] = applyUpdate(records[idx], fields);
+          saveAll(records);
+          return JSON.stringify({
+            result: `Updated record ${input.id}. Changed: ${Object.keys(fields).join(', ') || '(nothing)'}.`,
+          });
+        }
+
+        if (action === 'delete') {
+          if (!input.id) throw new Error('delete requires an id');
+          const before = records.length;
+          const kept = records.filter(r => r.id !== input.id);
+          if (kept.length === before) throw new Error(`No record with id ${input.id}`);
+          saveAll(kept);
+          return JSON.stringify({ result: `Deleted record ${input.id}. ${kept.length} record${kept.length === 1 ? '' : 's'} remain.` });
+        }
+
+        if (action === 'export') {
+          if (records.length === 0) {
+            return JSON.stringify({ result: 'No maintenance records to export yet.' });
+          }
+          const jsonl = toJSONL(records);
+          return JSON.stringify({
+            result: `Exporting ${records.length} record${records.length === 1 ? '' : 's'} as JSONL (one record per line). Copy everything between the fences to hand off to the memory-layer intake:\n\n\`\`\`jsonl\n${jsonl}\n\`\`\``,
+          });
+        }
+
+        if (action === 'wipe') {
+          localStorage.removeItem(STORAGE_KEY);
+          return JSON.stringify({ result: 'All maintenance records have been wiped from this device.' });
+        }
+
+        throw new Error(`Unknown action: ${action}`);
+      } catch (e) {
+        console.error(e);
+        return JSON.stringify({ error: `Maintenance Log error: ${e.message}` });
+      }
+    };
+  </script>
+</body>
+</html>
